@@ -7,7 +7,7 @@ import akka.http.scaladsl.model.{ HttpRequest, HttpResponse, RemoteAddress, Uri 
 import akka.http.scaladsl.model.headers.`X-Real-Ip`
 import akka.http.scaladsl.server.Route
 import akka.stream.scaladsl.{ Keep, Source }
-import akka.stream.OverflowStrategy
+import akka.stream.{ OverflowStrategy }
 import de.heikoseeberger.akkasse.EventStreamParser
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.election.{ ElectionService, LeadershipState }
@@ -17,6 +17,8 @@ import mesosphere.marathon.plugin.auth.{ Authenticator, Authorizer }
 import mesosphere.marathon.state.PathId
 import mesosphere.marathon.stream.{ Repeater, Sink }
 import org.scalatest.Inside
+import org.scalatest.exceptions.TestFailedException
+
 import scala.concurrent.Future
 
 class EventsControllerTest extends AkkaUnitTest with Inside {
@@ -38,12 +40,13 @@ class EventsControllerTest extends AkkaUnitTest with Inside {
     electionService.leaderHostPort returns Some("host:1")
     electionService.localHostPort returns "host:1"
     electionService.isLeader returns true
-    val (leaderStateEventsInput, leaderStateEvents) = Source.queue[LeadershipState](16, OverflowStrategy.fail)
-      .toMat(Repeater.sink(16, OverflowStrategy.fail))(Keep.both)
-      .run
-    electionService.leaderStateEvents returns leaderStateEvents
     implicit val authorizer = mock[Authorizer]
     implicit lazy val authenticator = mock[Authenticator]
+    final val maxEventQueueCapacity = 16
+    val (leaderStateEventsInput, leaderStateEvents) = Source.queue[LeadershipState](maxEventQueueCapacity, OverflowStrategy.fail)
+      .toMat(Repeater(maxEventQueueCapacity, OverflowStrategy.fail))(Keep.both)
+      .run
+    electionService.leaderStateEvents returns leaderStateEvents
 
     authorizer.isAuthorized(any, any, any) returns true
     authenticator.authenticate(any) returns Future.successful((Some(new Identity {})))
@@ -122,5 +125,22 @@ class EventsControllerTest extends AkkaUnitTest with Inside {
     f.leaderStateEventsInput.offer(LeadershipState.Standby(None))
 
     events.futureValue.flatMap(_.`type`) shouldBe Seq("event_stream_attached")
+  }
+
+  "Fails for queue overload" in withFixture() { f =>
+    val hideouslyLargeEventsCount = 50
+
+    val response = f.eventsRequest(Get())
+
+    val events = response.entity.dataBytes
+      .via(EventStreamParser(Int.MaxValue, Int.MaxValue))
+      .take(hideouslyLargeEventsCount)
+      .runWith(Sink.seq)
+
+    (1 to hideouslyLargeEventsCount).foreach(_ => f.eventBus.publish(testSchedulerReregisteredEvent))
+
+    the[TestFailedException] thrownBy {
+      events.futureValue
+    } should have message "The future returned an exception of type: akka.stream.BufferOverflowException, with message: Buffer overflow (max capacity was: 5)!."
   }
 }
